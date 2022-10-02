@@ -2,10 +2,10 @@ use std::{error::Error, net::ToSocketAddrs, fs::File};
 
 use ark_bls12_381::{Fr, G1Affine, G1Projective};
 use ark_ec::msm::VariableBaseMSM;
-use ark_ff::{FromBytes, PrimeField, ToBytes, UniformRand, Zero};
+use ark_ff::{FromBytes, PrimeField, ToBytes, UniformRand, Zero, Fp256};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use futures::{future::join_all, AsyncReadExt};
+use futures::{future::join_all, AsyncReadExt, TryFutureExt};
 use hello_world::{
     config::NetworkConfig,
     hello_world_capnp::{fft_peer, plonk},
@@ -167,15 +167,17 @@ use jf_plonk::{
 pub struct Prover {}
 
 impl Prover {
-    pub fn prove<C, R>(
+    pub async fn prove<C, R>(
         prng: &mut R,
         circuit: &C,
-        prove_key: &ProvingKey<Bls12_381>,
+        prove_key: &ProvingKey<'_, Bls12_381>,
     ) -> Result<Proof<Bls12_381>, PlonkError>
     where
         C: Arithmetization<Fr>,
         R: CryptoRng + RngCore,
     {
+        let network: NetworkConfig = serde_json::from_reader(File::open("config/network.json")?).unwrap();
+        let num_slaves = network.slaves.len();
         let n = circuit.eval_domain_size()?;
         let num_wire_types = circuit.num_wire_types();
 
@@ -222,6 +224,15 @@ impl Prover {
         let wires = circuit.wire_values();
 
         // Round 1
+        tokio::task::LocalSet::new()
+        .run_until(async move {
+            let connections = join_all(
+                network
+                    .slaves
+                    .iter()
+                    .map(|addr| async move { connect(addr).await.unwrap() }),
+            )
+            .await;
         let now = Instant::now();
         let wire_polys = wires
             .iter()
@@ -233,13 +244,12 @@ impl Prover {
                     + DensePolynomial::from_coefficients_vec(coeffs)
             })
             .collect::<Vec<_>>();
-        let wires_poly_comms = wire_polys
-            .iter()
-            .map(|poly| {
-                Self::commit_polynomial(/* context,  */ &ck, poly)
-            })
-            .collect::<Vec<_>>();
-        transcript.append_commitments(b"witness_poly_comms", &wires_poly_comms)?;
+        
+        let mut wires_poly_comms= vec![];
+        async{
+            wires_poly_comms = Self::commit_polynomial_poly(&connections, &num_slaves,&ck, &wire_polys).await.unwrap();
+            transcript.append_commitments(b"witness_poly_comms", &wires_poly_comms);
+        }.await;
         // println!("Elapsed: {:.2?}", now.elapsed());
 
         // Round 2
@@ -267,11 +277,8 @@ impl Prover {
             DensePolynomial::rand(2, prng).mul_by_vanishing_poly(domain)
                 + DensePolynomial::from_coefficients_vec(product_vec)
         };
-        let prod_perm_poly_comm = Self::commit_polynomial(
-            // context,
-            &ck,
-            &permutation_poly,
-        );
+        let prod_perm_poly_comm = Self::commit_polynomial(&connections, &num_slaves, &ck, &permutation_poly).await.unwrap();
+            
         transcript.append_commitment(b"perm_poly_comms", &prod_perm_poly_comm)?;
         // println!("Elapsed: {:.2?}", now.elapsed());
 
@@ -433,13 +440,19 @@ impl Prover {
                 .map(|coeffs| DensePolynomial::<Fr>::from_coefficients_slice(coeffs))
                 .collect::<Vec<_>>()
         };
-        let split_quot_poly_comms = split_quot_polys
-            .iter()
-            .map(|poly| {
-                Self::commit_polynomial(/* context,  */ &ck, poly)
-            })
-            .collect::<Vec<_>>();
-        transcript.append_commitments(b"quot_poly_comms", &split_quot_poly_comms)?;
+        /*let split_quot_poly_comms = join_all(split_quot_polys
+                .iter()
+                .map(|poly|  async move {
+                    Self::commit_polynomial(&connections, &num_slaves, &ck, poly).await.unwrap()
+                }))
+                .await;
+        transcript.append_commitments(b"quot_poly_comms", &split_quot_poly_comms)?;*/
+
+        let mut split_quot_poly_comms= vec![];
+        async{
+            split_quot_poly_comms = Self::commit_polynomial_poly(&connections, &num_slaves,&ck, &split_quot_polys).await.unwrap();
+            transcript.append_commitments(b"witness_poly_comms", &split_quot_poly_comms);
+        }.await;
         // println!("Elapsed: {:.2?}", now.elapsed());
 
         // Round 4
@@ -565,12 +578,7 @@ impl Prover {
                 }
                 quotient
             };
-
-            Self::commit_polynomial(
-                // context,
-                &ck,
-                &witness_poly,
-            )
+            Self::commit_polynomial(&connections, &num_slaves, &ck, &witness_poly).await.unwrap()
         };
 
         let shifted_opening_proof = {
@@ -590,12 +598,7 @@ impl Prover {
                 }
                 quotient
             };
-
-            Self::commit_polynomial(
-                // context,
-                &ck,
-                &witness_poly,
-            )
+            Self::commit_polynomial(&connections, &num_slaves, &ck, &witness_poly).await.unwrap()
         };
         // println!("Elapsed: {:.2?}", now.elapsed());
 
@@ -615,11 +618,25 @@ impl Prover {
                 perm_next_eval,
             },
         })
+        })
+        .await
     }
 }
 
 /// Private helper methods
 impl Prover {
+    // #[inline]
+    // fn ifft(
+    //     kernel: &SingleMultiexpKernel,
+    //     domain: &Radix2EvaluationDomain<Fr>,
+    //     coeffs: &mut Vec<Fr>,
+    // ) {
+    //     coeffs.resize(domain.size(), Fr::zero());
+    //     kernel
+    //         .radix_fft(coeffs, &domain.group_gen_inv, domain.log_size_of_group)
+    //         .unwrap();
+    //     coeffs.iter_mut().for_each(|val| *val *= domain.size_inv);
+    // }
     // #[inline]
     // fn ifft(
     //     kernel: &SingleMultiexpKernel,
@@ -667,23 +684,77 @@ impl Prover {
     // }
 
     #[inline]
-    fn commit_polynomial(
-        // context: &mut MultiScalarMultContext,
-        ck: &[G1Affine],
+    async fn commit_polynomial(
+        connections: &Vec<plonk::Client>,
+        num_slaves: &usize,
+        bases: &[G1Affine],
         poly: &[Fr],
-    ) -> Commitment<Bls12_381> {
+    ) -> Result<Commitment<Bls12_381>, Box<dyn Error>> {
         let mut plain_coeffs = poly.iter().map(|s| s.into_repr()).collect::<Vec<_>>();
 
-        plain_coeffs.resize(ck.len(), Fr::zero().into_repr());
+        plain_coeffs.resize(bases.len(), Fr::zero().into_repr());
 
-        let commitment = VariableBaseMSM::multi_scalar_mul(&ck, &plain_coeffs);
+        //let commitment = VariableBaseMSM::multi_scalar_mul(&ck, &plain_coeffs);
+        join_all(
+            bases
+                .chunks(bases.len() / num_slaves)
+                .zip(connections)
+                .map(|(bases, connection)| async move {
+                    init(connection, bases, 0, 0).await.unwrap();
+                }),
+        )
+        .await;
+
+        let commitment =
+            join_all(plain_coeffs.chunks(plain_coeffs.len() / num_slaves).zip(connections).map(
+                |(exps, connection)| async move { msm(&connection, exps).await.unwrap() },
+            ))
+            .await
+            .into_iter()
+            .reduce(|a, b| a + b)
+            .unwrap();
         // let commitment =
         //     kernel.multiexp(&ck, &plain_coeffs).unwrap();
         // let commitment = multi_scalar_mult::<G1Affine>(context, ck.len(), unsafe {
         //     std::mem::transmute(plain_coeffs.as_slice())
         // })[0];
 
-        Commitment(commitment.into())
+        Ok(Commitment(commitment.into()))
+    }
+
+    #[inline]
+    async fn commit_polynomial_poly(
+        connections: &Vec<plonk::Client>,
+        num_slaves: &usize,
+        bases: &[G1Affine],
+        wire_polys: &Vec<DensePolynomial<Fp256<FrParameters>>>,
+    ) -> Result<Vec<Commitment<Bls12_381>>, Box<dyn Error>> {
+        let res = join_all(wire_polys
+            .iter()
+            .map(|poly| async move {
+                    let mut plain_coeffs = poly.iter().map(|s| s.into_repr()).collect::<Vec<_>>();
+
+                    plain_coeffs.resize(bases.len(), Fr::zero().into_repr());
+
+                    let commitment =
+                        join_all(plain_coeffs.chunks(plain_coeffs.len() / num_slaves).zip(connections).map(
+                            |(exps, connection)| async move { msm(&connection, exps).await.unwrap() },
+                        ))
+                        .await
+                        .into_iter()
+                        .reduce(|a, b| a + b)
+                        .unwrap();
+                    Commitment(commitment.into())
+            })
+            .collect::<Vec<_>>()).await;
+
+        // let commitment =
+        //     kernel.multiexp(&ck, &plain_coeffs).unwrap();
+        // let commitment = multi_scalar_mult::<G1Affine>(context, ck.len(), unsafe {
+        //     std::mem::transmute(plain_coeffs.as_slice())
+        // })[0];
+
+        Ok(res)
     }
 }
 
@@ -1005,5 +1076,12 @@ fn test2() {
 
     let (pk, vk) = PlonkKzgSnark::<Bls12_381>::preprocess(&srs, &circuit).unwrap();
 
-    Prover::prove(&mut rng, &circuit, &pk).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            Prover::prove(&mut rng, &circuit, &pk).await;
+        })
+    
 }
