@@ -5,3 +5,6 @@ pub mod utils;
 pub mod playground;
 
 pub mod config;
+
+pub mod plonk;
+pub mod transpose;

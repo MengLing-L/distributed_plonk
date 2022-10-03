@@ -1,3 +1,5 @@
+use ark_ff::PrimeField;
+
 #[derive(Clone, Debug)]
 pub struct FftWorkload {
     pub row_start: usize,
@@ -14,6 +16,12 @@ impl FftWorkload {
     pub const fn num_cols(&self) -> usize {
         self.col_end - self.col_start
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct MsmWorkload {
+    pub start: usize,
+    pub end: usize,
 }
 
 pub fn serialize<T>(v: &[T]) -> &[u8] {

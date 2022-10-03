@@ -14,13 +14,17 @@ path = "src/worker.rs"
 name = "dispatcher"
 path = "src/dispatcher.rs"
 
+[[bin]]
+name = "dispatcher2"
+path = "src/dispatcher2.rs"
+
 [build-dependencies]
 capnpc = "*"
 
 [dependencies]
 capnp = "*"
 futures = "0.3.0"
-tokio = { version = "1.0.0", features = ["net", "rt", "macros"]}
+tokio = { version = "1.0.0", features = ["full"]}
 tokio-util = { version = "0.6.0", features = ["compat"] }
 capnp-rpc = "*"
 rand = "^0"
@@ -31,11 +35,12 @@ ark-std = "0.3.0"
 ark-ec = { version = "0.3.0", features = [ "parallel" ] }
 ark-bls12-381 = { version = "0.3.0" }
 jf-utils = { git = "https://github.com/EspressoSystems/jellyfish", branch = "turbo-plonk" }
-jf-primitives = { git = "https://github.com/winderica/jellyfish", branch = "turbo-plonk" }
-jf-plonk = { git = "https://github.com/winderica/jellyfish", branch = "turbo-plonk" }
+jf-primitives = { git = "https://github.com/EspressoSystems/jellyfish", branch = "turbo-plonk" }
+jf-plonk = { git = "https://github.com/EspressoSystems/jellyfish", branch = "turbo-plonk" }
 merlin = "3.0.0"
 serde = "1.0.145"
 serde_json = "1.0.85"
+rayon = "1.5.3"
 
 [dependencies.ark-poly-commit]
 git = "https://github.com/arkworks-rs/poly-commit/"
