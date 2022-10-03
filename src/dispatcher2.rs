@@ -13,7 +13,7 @@ use hello_world::{
     hello_world_capnp::{plonk_slave},
     utils::{deserialize, serialize, FftWorkload, MsmWorkload},
 };
-use jf_plonk::{prelude::PlonkKzgSnark, circuit::{GateId, gates::Gate, Variable, WireId}};
+
 use jf_plonk::prelude::*;
 use jf_primitives::{
     circuit::merkle_tree::{AccElemVars, AccMemberWitnessVar, MerkleTreeGadget},
@@ -23,7 +23,15 @@ use rand::{distributions::Standard, thread_rng, Rng};
 
 use ark_ec::AffineCurve;
 
-use jf_plonk::prelude::{PlonkError, VerifyingKey};
+use jf_plonk::{
+    circuit::{gates::Gate, Arithmetization, GateId, Variable, WireId},
+    constants::GATE_WIDTH,
+    errors::{CircuitError, SnarkError},
+    prelude::{
+        Circuit, PlonkCircuit, PlonkError, Proof, ProofEvaluations, ProvingKey, VerifyingKey,
+    },
+    proof_system::{PlonkKzgSnark, Snark},
+};
 
 use ark_ec::{
     short_weierstrass_jacobian::GroupAffine, PairingEngine, SWModelParameters as SWParam,
@@ -34,9 +42,9 @@ use merlin::Transcript;
 
 
 /// A wrapper of `merlin::Transcript`.
-struct StandardTranscript(Transcript);
+struct FakeStandardTranscript(Transcript);
 
-impl StandardTranscript {
+impl FakeStandardTranscript {
     /// create a new plonk transcript
     pub fn new(label: &'static [u8]) -> Self {
         Self(Transcript::new(label))
@@ -159,12 +167,6 @@ use ark_std::{
     vec,
     vec::Vec,
 };
-use jf_plonk::{
-    circuit::Arithmetization,
-    constants::GATE_WIDTH,
-    errors::{CircuitError, SnarkError},
-    prelude::{CommitKey, Proof, ProofEvaluations, ProvingKey},
-};
 
 /// A specific Plonk circuit instantiation.
 #[derive(Debug, Clone)]
@@ -235,7 +237,7 @@ impl Prover {
         }
 
         // Initialize transcript
-        let mut transcript = StandardTranscript::new(b"PlonkProof");
+        let mut transcript = FakeStandardTranscript::new(b"PlonkProof");
         let mut pub_input = circuit.public_input()?;
 
         transcript.append_vk_and_pub_input(&prove_key.vk, &pub_input)?;
@@ -297,7 +299,7 @@ impl Prover {
                         let mut coeffs = wire_vars.iter().map(|&var| circuit.witness[var]).collect();
                         //domain.ifft_in_place(&mut coeffs);
                         // Self::ifft(&kernel, &domain, &mut coeffs);
-                        Self::ifft(connections, num_slaves, &workloads_d, &mut coeffs, r_d, c_d).await.unwrap()
+                        Self::fft(connections, num_slaves, workloads_d, &domain, &mut coeffs, false, true, false).await.unwrap()
                         // DensePolynomial::rand(1, prng).mul_by_vanishing_poly(domain)
                         //     + DensePolynomial::from_coefficients_vec(coeffs)
                     })
@@ -342,7 +344,7 @@ impl Prover {
                         product_vec.push(product_vec[j] * a / b);
                     }
                     //domain.ifft_in_place(&mut product_vec);
-                    product_vec = Self::ifft(connections, num_slaves, &workloads_d, &mut product_vec, r_d, c_d).await.unwrap();
+                    product_vec = Self::fft(connections, num_slaves, workloads_d, &domain,&mut product_vec,false, true, false).await.unwrap();
                     //Self::ifft(&kernel, &domain, &mut product_vec);
                     DensePolynomial::rand(2, prng).mul_by_vanishing_poly(domain)
                         + DensePolynomial::from_coefficients_vec(product_vec)
@@ -377,48 +379,53 @@ impl Prover {
                         .collect::<Vec<_>>();
 
                     // Compute coset evaluations.
-                    let selectors_coset_fft = prove_key
+                    let selectors_coset_fft = join_all(prove_key
                         .selectors
                         .iter()
-                        .map(|poly| {
+                        .map(|poly| async move{
                             let mut coeffs = poly.coeffs().to_vec();
-                            quot_domain.coset_fft_in_place(&mut coeffs);
+                            //quot_domain.coset_fft_in_place(&mut coeffs);
+                            coeffs = Self::fft(connections, num_slaves, workloads_q, &quot_domain, &mut coeffs,true, false, true).await.unwrap();
                             // Self::coset_fft(&kernel, &quot_domain, &mut coeffs);
                             coeffs
                         })
-                        .collect::<Vec<_>>();
-                    let sigmas_coset_fft = prove_key
+                        .collect::<Vec<_>>()).await;
+                    let sigmas_coset_fft = join_all(prove_key
                         .sigmas
                         .iter()
-                        .map(|poly| {
+                        .map(|poly| async move{
                             let mut coeffs = poly.coeffs().to_vec();
-                            quot_domain.coset_fft_in_place(&mut coeffs);
+                            //quot_domain.coset_fft_in_place(&mut coeffs);
+                            coeffs = Self::fft(connections, num_slaves, workloads_q, &quot_domain, &mut coeffs,true, false, true).await.unwrap();
                             // Self::coset_fft(&kernel, &quot_domain, &mut coeffs);
                             coeffs
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>()).await;
 
-                    let wire_polys_coset_fft = wire_polys
+                    let wire_polys_coset_fft = join_all(wire_polys
                         .iter()
-                        .map(|poly| {
+                        .map(|poly| async move{
                             let mut coeffs = poly.coeffs().to_vec();
-                            quot_domain.coset_fft_in_place(&mut coeffs);
+                            //quot_domain.coset_fft_in_place(&mut coeffs);
+                            coeffs = Self::fft(connections, num_slaves, workloads_q, &quot_domain, &mut coeffs,true, false, true).await.unwrap();
                             // Self::coset_fft(&kernel, &quot_domain, &mut coeffs);
                             coeffs
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Vec<_>>()).await;
                     // TODO: (binyi) we can also compute below in parallel with
                     // `wire_polys_coset_fft`.
                     let prod_perm_poly_coset_fft = {
                         let mut coeffs = permutation_poly.coeffs().to_vec();
-                        quot_domain.coset_fft_in_place(&mut coeffs);
+                        //quot_domain.coset_fft_in_place(&mut coeffs);
+                        coeffs = Self::fft(connections, num_slaves, workloads_q, &quot_domain, &mut coeffs,true, false, true).await.unwrap();
                         // Self::coset_fft(&kernel, &quot_domain, &mut coeffs);
                         coeffs
                     };
                     let pub_input_poly_coset_fft = {
-                        domain.ifft_in_place(&mut pub_input);
-                        //pub_input = Self::ifft(connections, num_slaves, &workloads_d, &mut pub_input, r_d, c_d).await.unwrap();
-                        quot_domain.coset_fft_in_place(&mut pub_input);
+                        //domain.ifft_in_place(&mut pub_input);
+                        pub_input = Self::fft(connections, num_slaves, workloads_d, &domain,&mut pub_input,false, true, false).await.unwrap();
+                        //quot_domain.coset_fft_in_place(&mut pub_input);
+                        pub_input = Self::fft(connections, num_slaves, workloads_q, &quot_domain, &mut pub_input,true, false, true).await.unwrap();
                         // Self::ifft(&kernel, &domain, &mut pub_input);
                         // Self::coset_fft(&kernel, &quot_domain, &mut pub_input);
                         pub_input
@@ -722,20 +729,21 @@ impl Prover {
     // }
 
     #[inline]
-    async fn ifft(
+    async fn fft(
         connections: &Vec<plonk_slave::Client>,
         num_slaves: usize,
         workloads: &[FftWorkload],
-        //domain: &Radix2EvaluationDomain<Fr>,
+        domain: &Radix2EvaluationDomain<Fr>,
         coeffs: &mut Vec<Fr>,
-        r: usize,
-        c: usize,
+        is_quot: bool,
+        is_inv: bool,
+        is_coset: bool
     )-> Result<Vec<Fr>, Box<dyn Error>>  {
         let rng = &mut thread_rng();
         let id: u64 = rng.gen();
-        let is_quot = false;
-        let is_inv = true;
-        let is_coset = false;
+        let r = 1 << (domain.log_size_of_group >> 1);
+        let c = domain.size() / r;
+        coeffs.resize(domain.size(), Default::default());
 
         join_all(connections.iter().map(|connection| async move {
             fft_init(connection, id, workloads, is_quot, is_inv, is_coset)
@@ -1186,9 +1194,9 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Merkle Tree height
-pub const TREE_HEIGHT: u8 = 10;
+pub const TREE_HEIGHT: u8 = 32;
 /// Number of memberships proofs to be verified in the circuit
-pub const NUM_MEMBERSHIP_PROOFS: usize = 1;
+pub const NUM_MEMBERSHIP_PROOFS: usize = 640;
 
 /// generate a gigantic circuit (with random, satisfiable wire assignments)
 ///
@@ -1243,17 +1251,23 @@ pub fn generate_circuit<R: Rng>(rng: &mut R) -> Result<PlonkCircuit<Fr>, PlonkEr
 #[test]
 fn test2() {
     let mut rng = rand::thread_rng();
+
     let circuit = generate_circuit(&mut rng).unwrap();
     let srs =
         PlonkKzgSnark::<Bls12_381>::universal_setup(circuit.srs_size().unwrap(), &mut rng).unwrap();
-
     let (pk, vk) = PlonkKzgSnark::<Bls12_381>::preprocess(&srs, &circuit).unwrap();
 
+    // verify the proof against the public inputs.
     tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            Prover::prove(&mut rng, &circuit, &pk).await;
-        })
+    .enable_all()
+    .build()
+    .unwrap()
+    .block_on(async {
+        let proof = Prover::prove(&mut rng, &circuit, &pk).await.unwrap();
+        let public_inputs = circuit.public_input().unwrap();
+        assert!(
+            PlonkKzgSnark::<Bls12_381>::verify::<StandardTranscript>(&vk, &public_inputs, &proof,)
+                .is_ok()
+        );
+    })
 }
