@@ -842,7 +842,7 @@ impl Prover {
 
         plain_coeffs.resize(bases.len(), Fr::zero().into_repr());
 
-        let commitment = VariableBaseMSM::multi_scalar_mul(&bases, &plain_coeffs);
+        //let commitment = VariableBaseMSM::multi_scalar_mul(&bases, &plain_coeffs);
         // join_all(
         //     bases
         //         .chunks(bases.len() / num_slaves)
@@ -866,6 +866,28 @@ impl Prover {
         // let commitment = multi_scalar_mult::<G1Affine>(context, ck.len(), unsafe {
         //     std::mem::transmute(plain_coeffs.as_slice())
         // })[0];
+
+        let commitment = join_all(
+            plain_coeffs.chunks(plain_coeffs.len() / num_slaves)
+                .enumerate()
+                .map(|(i, scalars)| {
+                    (
+                        MsmWorkload {
+                            start: i * plain_coeffs.len() / num_slaves,
+                            end: (i + 1) * plain_coeffs.len() / num_slaves,
+                        },
+                        scalars,
+                    )
+                })
+                .zip(connections)
+                .map(|((workload, scalars), connection)| async move {
+                    msm(&connection, &workload, scalars).await.unwrap()
+                }),
+        )
+        .await
+        .into_iter()
+        .reduce(|a, b| a + b)
+        .unwrap();
 
         Ok(Commitment(commitment.into()))
     }
@@ -1196,7 +1218,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 /// Merkle Tree height
 pub const TREE_HEIGHT: u8 = 32;
 /// Number of memberships proofs to be verified in the circuit
-pub const NUM_MEMBERSHIP_PROOFS: usize = 640;
+pub const NUM_MEMBERSHIP_PROOFS: usize = 50;
 
 /// generate a gigantic circuit (with random, satisfiable wire assignments)
 ///
